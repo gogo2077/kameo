@@ -39,7 +39,11 @@ use super::{
 /// }
 ///
 /// let peer_id = PeerId::random();
-/// let behaviour = remote::Behaviour::new(peer_id, remote::messaging::Config::default());
+/// let behaviour = remote::Behaviour::new(
+///     peer_id,
+///     remote::messaging::Config::default(),
+///     remote::registry::Config::default(),
+/// );
 /// ```
 #[allow(missing_debug_implementations)]
 pub struct Behaviour {
@@ -59,6 +63,7 @@ impl Behaviour {
     ///
     /// * `local_peer_id` - The peer ID of the local node
     /// * `messaging_config` - Configuration for the messaging subsystem
+    /// * `registry_config` - Configuration for the registry subsystem
     ///
     /// # Example
     ///
@@ -68,13 +73,17 @@ impl Behaviour {
     ///
     /// let peer_id = PeerId::random();
     /// let config = remote::messaging::Config::default();
-    /// let behaviour = remote::Behaviour::new(peer_id, config);
+    /// let behaviour = remote::Behaviour::new(peer_id, config, remote::registry::Config::default());
     /// ```
-    pub fn new(local_peer_id: PeerId, messaging_config: messaging::Config) -> Self {
+    pub fn new(
+        local_peer_id: PeerId,
+        messaging_config: messaging::Config,
+        registry_config: registry::Config,
+    ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
         let messaging = messaging::Behaviour::new(local_peer_id, messaging_config);
-        let registry = registry::Behaviour::new(local_peer_id);
+        let registry = registry::Behaviour::new(local_peer_id, registry_config);
 
         Behaviour {
             messaging,
@@ -98,7 +107,11 @@ impl Behaviour {
     /// use libp2p::PeerId;
     ///
     /// let peer_id = PeerId::random();
-    /// let behaviour = remote::Behaviour::new(peer_id, remote::messaging::Config::default());
+    /// let behaviour = remote::Behaviour::new(
+    ///     peer_id,
+    ///     remote::messaging::Config::default(),
+    ///     remote::registry::Config::default(),
+    /// );
     ///
     /// // Initialize the global swarm
     /// behaviour.init_global();

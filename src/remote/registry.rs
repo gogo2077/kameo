@@ -57,7 +57,8 @@ use crate::{
     error::RegistryError,
 };
 
-const PROTO_NAME: StreamProtocol = StreamProtocol::new("/kameo/registry/1.0.0");
+/// The libp2p protocol name used for the registry.
+pub const PROTO_NAME: StreamProtocol = StreamProtocol::new("/kameo/registry/kad/1.0.0");
 
 type RegisterResult = Result<(), RegistryError>;
 pub(super) type LookupResult = Result<ActorRegistration<'static>, RegistryError>;
@@ -161,6 +162,28 @@ pub enum Event {
     },
 }
 
+/// The configuration for a `registry::Behaviour` protocol.
+#[derive(Debug, Clone)]
+pub struct Config {
+    protocol_name: StreamProtocol,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            protocol_name: PROTO_NAME,
+        }
+    }
+}
+
+impl Config {
+    /// Sets the protocol name for the registry protocol.
+    pub fn with_protocol_name(mut self, protocol_name: StreamProtocol) -> Self {
+        self.protocol_name = protocol_name;
+        self
+    }
+}
+
 /// `Behaviour` is a `NetworkBehaviour` that implements the kameo registry behaviour
 /// on top of the Kademlia protocol.
 #[allow(missing_debug_implementations)]
@@ -175,28 +198,28 @@ pub struct Behaviour {
 
 impl Behaviour {
     /// Creates a new registry behaviour.
-    pub fn new(local_peer_id: PeerId) -> Self {
-        let mut config = kad::Config::new(PROTO_NAME);
+    pub fn new(local_peer_id: PeerId, config: Config) -> Self {
+        let mut kad_config = kad::Config::new(config.protocol_name);
 
         // Faster lookups for responsive actor discovery
-        config.set_query_timeout(Duration::from_secs(10)); // Default: 60s
+        kad_config.set_query_timeout(Duration::from_secs(10)); // Default: 60s
 
         // Lower replication for efficiency while maintaining availability
-        config.set_replication_factor(NonZero::new(5).unwrap()); // Default: 20
+        kad_config.set_replication_factor(NonZero::new(5).unwrap()); // Default: 20
 
         // Shorter TTL since actors are more dynamic than files
-        config.set_record_ttl(Some(Duration::from_secs(3600))); // 1 hour, Default: 36 hours
+        kad_config.set_record_ttl(Some(Duration::from_secs(3600))); // 1 hour, Default: 36 hours
 
         // More frequent re-publication for dynamic actors
-        config.set_publication_interval(Some(Duration::from_secs(1800))); // 30 minutes, Default: 24 hours
+        kad_config.set_publication_interval(Some(Duration::from_secs(1800))); // 30 minutes, Default: 24 hours
 
         // Filter records to prevent registry pollution
-        config.set_record_filtering(StoreInserts::FilterBoth); // Default: Unfiltered
+        kad_config.set_record_filtering(StoreInserts::FilterBoth); // Default: Unfiltered
 
         let mut kademlia = kad::Behaviour::with_config(
             local_peer_id,
             kad::store::MemoryStore::new(local_peer_id),
-            config,
+            kad_config,
         );
         kademlia.set_mode(Some(kad::Mode::Server));
 

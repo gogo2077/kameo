@@ -58,7 +58,8 @@ use super::_internal::{
     REMOTE_ACTORS, REMOTE_MESSAGES, RemoteActorFns, RemoteMessageFns, RemoteMessageRegistrationID,
 };
 
-const PROTO_NAME: StreamProtocol = StreamProtocol::new("/kameo/messaging/1.0.0");
+/// The libp2p protocol name used for messaging.
+pub const PROTO_NAME: StreamProtocol = StreamProtocol::new("/kameo/messaging/1.0.0");
 
 static REMOTE_ACTORS_MAP: LazyLock<HashMap<&'static str, RemoteActorFns>> = LazyLock::new(|| {
     let mut existing_ids = HashSet::new();
@@ -349,8 +350,9 @@ pub enum Event {
 }
 
 /// The configuration for a `messaging::Behaviour` protocol.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Config {
+    protocol_name: StreamProtocol,
     request_timeout: Duration,
     max_concurrent_streams: usize,
     request_size_maximum: u64,
@@ -360,6 +362,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            protocol_name: PROTO_NAME,
             request_timeout: Duration::from_secs(10),
             max_concurrent_streams: 100,
             request_size_maximum: 1024 * 1024,
@@ -369,6 +372,12 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Sets the protocol name for the messaging protocol.
+    pub fn with_protocol_name(mut self, protocol_name: StreamProtocol) -> Self {
+        self.protocol_name = protocol_name;
+        self
+    }
+
     /// Sets the timeout for inbound and outbound requests.
     pub fn with_request_timeout(mut self, v: Duration) -> Self {
         self.request_timeout = v;
@@ -424,9 +433,10 @@ pub struct Behaviour {
 impl Behaviour {
     /// Creates a new messaging behaviour.
     pub fn new(local_peer_id: PeerId, config: Config) -> Self {
+        let protocol_name = config.protocol_name.clone();
         let request_response = request_response::cbor::Behaviour::with_codec(
-            config.into(),
-            [(PROTO_NAME, request_response::ProtocolSupport::Full)],
+            config.clone().into(),
+            [(protocol_name, request_response::ProtocolSupport::Full)],
             config.into(),
         );
 

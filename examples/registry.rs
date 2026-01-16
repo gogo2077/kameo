@@ -23,6 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use futures::StreamExt;
     use kameo::remote::messaging;
+    use kameo::remote::registry;
     use libp2p::{noise, tcp, yamux};
 
     let mut swarm = libp2p::SwarmBuilder::with_new_identity()
@@ -36,6 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let actors = kameo::remote::Behaviour::new(
                 key.public().to_peer_id(),
                 messaging::Config::default(),
+                registry::Config::default(),
             );
 
             Ok(actors)

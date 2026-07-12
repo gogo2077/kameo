@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use kameo::{
     console::{
-        Console,
+        Client, Console,
         wire::{ActorStatus, Message as WireMessage, RestartPolicy},
     },
     error::Infallible,
@@ -69,6 +69,63 @@ async fn serves_live_snapshot_over_tcp() {
     assert!(echo.counters.messages_received >= 1);
     assert!(snapshot.totals.alive >= 1);
 
+    console.shutdown();
+}
+
+#[tokio::test]
+async fn authenticated_client_serves_snapshot() {
+    let console = Console::builder()
+        .auth_token("a sufficiently long shared token for tests")
+        .serve("127.0.0.1:0")
+        .await
+        .unwrap();
+    let mut client = Client::connect(
+        console.local_addr(),
+        Duration::from_secs(1),
+        Some(b"a sufficiently long shared token for tests"),
+    )
+    .await
+    .unwrap();
+
+    let snapshot = client.snapshot().await.unwrap();
+    assert!(snapshot.seq > 0);
+    console.shutdown();
+}
+
+#[tokio::test]
+async fn authenticated_client_rejects_wrong_token() {
+    let console = Console::builder()
+        .auth_token("a sufficiently long shared token for tests")
+        .serve("127.0.0.1:0")
+        .await
+        .unwrap();
+    let error = Client::connect(
+        console.local_addr(),
+        Duration::from_secs(1),
+        Some(b"the wrong shared token for this server"),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    console.shutdown();
+}
+
+#[tokio::test]
+async fn authenticated_connections_receive_unique_challenges() {
+    let console = Console::builder()
+        .auth_token("a sufficiently long shared token for tests")
+        .serve("127.0.0.1:0")
+        .await
+        .unwrap();
+    let mut first = TcpStream::connect(console.local_addr()).await.unwrap();
+    let mut second = TcpStream::connect(console.local_addr()).await.unwrap();
+    let mut first_challenge = [0; 37];
+    let mut second_challenge = [0; 37];
+    first.read_exact(&mut first_challenge).await.unwrap();
+    second.read_exact(&mut second_challenge).await.unwrap();
+
+    assert_ne!(first_challenge, second_challenge);
     console.shutdown();
 }
 

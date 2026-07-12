@@ -8,7 +8,7 @@ use clap::Parser;
 use kameo_console::{App, ConnectionState, spawn_poller};
 
 /// Terminal monitor for kameo actor systems.
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 #[command(name = "kameo-console", version, about, long_about = None)]
 pub struct Args {
     /// Address of the kameo app's console collector to connect to.
@@ -22,6 +22,10 @@ pub struct Args {
     /// Max time to wait when establishing/re-establishing the connection.
     #[arg(long, default_value = "2s", value_parser = humantime::parse_duration)]
     pub connect_timeout: Duration,
+
+    /// Shared authentication token. Falls back to KAMEO_CONSOLE_TOKEN.
+    #[arg(long)]
+    pub token: Option<String>,
 
     /// Render hardcoded sample data instead of connecting to a running app.
     #[arg(long)]
@@ -40,6 +44,13 @@ fn main() -> color_eyre::Result<()> {
     } else {
         args.addr
     };
+    let auth_token = if args.demo {
+        None
+    } else {
+        args.token
+            .or_else(|| std::env::var("KAMEO_CONSOLE_TOKEN").ok())
+            .map(Arc::<str>::from)
+    };
 
     let snapshot = Arc::new(Mutex::new(None));
     let connection = Arc::new(Mutex::new(ConnectionState::Connecting));
@@ -48,6 +59,7 @@ fn main() -> color_eyre::Result<()> {
         addr,
         Arc::clone(&interval),
         args.connect_timeout,
+        auth_token,
         Arc::clone(&snapshot),
         Arc::clone(&connection),
     );

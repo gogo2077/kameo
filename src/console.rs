@@ -7,9 +7,11 @@
 // A ready-made demo actor system for showcasing the console (used by the `console` example and
 // `kameo_console --demo`). Hidden from the docs as it isn't part of the public API; its docs live
 // in the module's own `//!` comment so intra-doc links resolve in the module's scope.
+mod client;
 #[doc(hidden)]
 #[allow(missing_docs, missing_debug_implementations)]
 pub mod demo;
+mod protocol;
 pub(crate) mod registry;
 mod server;
 /// The console wire protocol (the serialization contract with console clients).
@@ -20,4 +22,5 @@ mod server;
 #[allow(missing_docs)] // the protocol is intentionally undocumented; see the note above
 pub mod wire;
 
+pub use client::Client;
 pub use server::{Console, ConsoleHandle, serve};

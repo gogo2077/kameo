@@ -48,6 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```rust
 let console = kameo::console::Console::builder()
     .grave_window(std::time::Duration::from_secs(10))
+    .auth_token("use-a-long-random-shared-token")
     .serve("127.0.0.1:9999")
     .await?;
 ```
@@ -68,7 +69,13 @@ address:
 
 ```sh
 kameo-console 127.0.0.1:9999
+kameo-console 127.0.0.1:9999 --token "use-a-long-random-shared-token"
 ```
+
+The client also reads `KAMEO_CONSOLE_TOKEN` when `--token` is omitted. Authenticated servers
+use a fresh nonce and HMAC-SHA256 challenge for each connection, so the shared token is never
+sent directly over the network. Snapshot payloads are still plain TCP; use a trusted network or
+an encrypted tunnel when confidentiality is required.
 
 Or change the poll interval at startup, and try it without a running application using the built
 in demo data:
@@ -95,6 +102,7 @@ cargo run -p kameo_console -- --demo
 | `<addr>` (positional) | `127.0.0.1:9999` | Address of the application's console collector |
 | `-i`, `--interval` | `500ms` | Snapshot poll interval, adjustable at runtime with `-` and `+` |
 | `--connect-timeout` | `2s` | Maximum time to wait when establishing the connection |
+| `--token` | `KAMEO_CONSOLE_TOKEN` | Shared token for authenticated collectors |
 | `--demo` | | Render built in sample data instead of connecting |
 
 ## What it shows

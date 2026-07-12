@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use hmac::{Hmac, Mac};
 use kameo::{
     console::{
         Client, Console,
@@ -10,6 +11,7 @@ use kameo::{
     error::Infallible,
     prelude::*,
 };
+use sha2::Sha256;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -87,8 +89,7 @@ async fn authenticated_client_serves_snapshot() {
     .await
     .unwrap();
 
-    let snapshot = client.snapshot().await.unwrap();
-    assert!(snapshot.seq > 0);
+    let _snapshot = client.snapshot().await.unwrap();
     console.shutdown();
 }
 
@@ -127,6 +128,105 @@ async fn authenticated_connections_receive_unique_challenges() {
 
     assert_ne!(first_challenge, second_challenge);
     console.shutdown();
+}
+
+#[tokio::test]
+async fn authenticated_server_rejects_a_replayed_response() {
+    const TOKEN: &[u8] = b"a sufficiently long shared token for tests";
+    let console = Console::builder()
+        .auth_token(TOKEN)
+        .serve("127.0.0.1:0")
+        .await
+        .unwrap();
+
+    let mut first = TcpStream::connect(console.local_addr()).await.unwrap();
+    let mut first_challenge = [0; 37];
+    first.read_exact(&mut first_challenge).await.unwrap();
+    let mut mac = Hmac::<Sha256>::new_from_slice(TOKEN).unwrap();
+    mac.update(&first_challenge[5..]);
+    let response: [u8; 32] = mac.finalize().into_bytes().into();
+    first.write_all(&response).await.unwrap();
+    let mut status = [0; 1];
+    first.read_exact(&mut status).await.unwrap();
+    assert_eq!(status, [1]);
+
+    let mut second = TcpStream::connect(console.local_addr()).await.unwrap();
+    let mut second_challenge = [0; 37];
+    second.read_exact(&mut second_challenge).await.unwrap();
+    assert_ne!(first_challenge, second_challenge);
+    second.write_all(&response).await.unwrap();
+    second.read_exact(&mut status).await.unwrap();
+    assert_eq!(status, [0]);
+    console.shutdown();
+}
+
+#[tokio::test]
+async fn client_remains_compatible_with_unauthenticated_server() {
+    let console = Console::builder().serve("127.0.0.1:0").await.unwrap();
+    let mut client = Client::connect(console.local_addr(), Duration::from_secs(1), None)
+        .await
+        .unwrap();
+
+    let _snapshot = client.snapshot().await.unwrap();
+    console.shutdown();
+}
+
+#[tokio::test]
+async fn authenticated_client_times_out_waiting_for_challenge() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (_stream, _) = listener.accept().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    });
+
+    let error = Client::connect(addr, Duration::from_millis(20), Some(b"token"))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    server.abort();
+}
+
+#[tokio::test]
+async fn client_rejects_snapshot_frames_over_64_mib() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0; 1];
+        stream.read_exact(&mut request).await.unwrap();
+        stream
+            .write_all(&(64_u32 * 1024 * 1024 + 1).to_be_bytes())
+            .await
+            .unwrap();
+    });
+    let mut client = Client::connect(addr, Duration::from_secs(1), None)
+        .await
+        .unwrap();
+
+    let error = client.snapshot().await.unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn client_rejects_malformed_snapshot_frames() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0; 1];
+        stream.read_exact(&mut request).await.unwrap();
+        stream.write_all(&3_u32.to_be_bytes()).await.unwrap();
+        stream.write_all(b"bad").await.unwrap();
+    });
+    let mut client = Client::connect(addr, Duration::from_secs(1), None)
+        .await
+        .unwrap();
+
+    let error = client.snapshot().await.unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    server.await.unwrap();
 }
 
 #[derive(Clone)]

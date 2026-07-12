@@ -47,9 +47,7 @@ fn main() -> color_eyre::Result<()> {
     let auth_token = if args.demo {
         None
     } else {
-        args.token
-            .or_else(|| std::env::var("KAMEO_CONSOLE_TOKEN").ok())
-            .map(Arc::<str>::from)
+        resolve_auth_token(args.token, |name| std::env::var(name).ok())
     };
 
     let snapshot = Arc::new(Mutex::new(None));
@@ -75,6 +73,15 @@ fn main() -> color_eyre::Result<()> {
     })?;
 
     Ok(())
+}
+
+fn resolve_auth_token(
+    argument: Option<String>,
+    mut read_env: impl FnMut(&str) -> Option<String>,
+) -> Option<Arc<str>> {
+    argument
+        .or_else(|| read_env("KAMEO_CONSOLE_TOKEN"))
+        .map(Arc::<str>::from)
 }
 
 /// Thread-name prefix for the demo runtime's workers, used to filter intentional panics.
@@ -126,4 +133,31 @@ fn spawn_demo_server() -> SocketAddr {
         });
     });
     addr_rx.recv().expect("demo server failed to start")
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser as _;
+
+    use super::{Args, resolve_auth_token};
+
+    #[test]
+    fn token_argument_takes_precedence_over_environment() {
+        let token = resolve_auth_token(Some("argument".to_string()), |_| {
+            Some("environment".to_string())
+        });
+        assert_eq!(token.as_deref(), Some("argument"));
+    }
+
+    #[test]
+    fn token_falls_back_to_environment() {
+        let token = resolve_auth_token(None, |_| Some("environment".to_string()));
+        assert_eq!(token.as_deref(), Some("environment"));
+    }
+
+    #[test]
+    fn cli_accepts_token_argument() {
+        let args = Args::try_parse_from(["kameo-console", "--token", "secret"]).unwrap();
+        assert_eq!(args.token.as_deref(), Some("secret"));
+    }
 }

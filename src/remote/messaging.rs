@@ -1408,3 +1408,21 @@ async fn signal_link_died(
 
     (fns.signal_link_died)(dead_actor_id, notified_actor_id, stop_reason).await
 }
+
+#[cfg(test)]
+mod tests {
+    use libp2p::StreamProtocol;
+
+    use super::Config;
+
+    #[test]
+    fn config_preserves_custom_protocol_name() {
+        let config = Config::default()
+            .with_protocol_name(StreamProtocol::new("/custom-kameo/messaging/1.0.0"));
+
+        assert_eq!(
+            config.protocol_name.as_ref(),
+            "/custom-kameo/messaging/1.0.0"
+        );
+    }
+}

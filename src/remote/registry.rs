@@ -1218,3 +1218,21 @@ impl fmt::Display for InvalidActorRegistration {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use libp2p::StreamProtocol;
+
+    use super::Config;
+
+    #[test]
+    fn config_preserves_custom_protocol_name() {
+        let config = Config::default()
+            .with_protocol_name(StreamProtocol::new("/custom-kameo/registry/kad/1.0.0"));
+
+        assert_eq!(
+            config.protocol_name.as_ref(),
+            "/custom-kameo/registry/kad/1.0.0"
+        );
+    }
+}

@@ -162,12 +162,12 @@ impl ActorId {
 impl fmt::Display for ActorId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         #[cfg(not(feature = "remote"))]
-        return write!(f, "ActorId({})", self.sequence_id);
+        return write!(f, "#{}", self.sequence_id);
 
         #[cfg(feature = "remote")]
         match self.peer_id.peer_id() {
-            Some(peer_id) => write!(f, "ActorId({}, {peer_id})", self.sequence_id),
-            None => write!(f, "ActorId({}, local)", self.sequence_id),
+            Some(peer_id) => write!(f, "#{}@{peer_id}", self.sequence_id),
+            None => write!(f, "#{}@local", self.sequence_id),
         }
     }
 }
@@ -238,17 +238,18 @@ impl<'de> Deserialize<'de> for ActorId {
 
 /// Errors that can occur when deserializing an `ActorId` from bytes.
 #[derive(Debug)]
+#[cfg_attr(not(feature = "remote"), derive(Clone))]
 pub enum ActorIdFromBytesError {
     /// The byte slice doesn't contain enough data for the `sequence_id`.
     MissingSequenceID,
     /// An error occurred while parsing the `PeerId`.
     #[cfg(feature = "remote")]
-    ParsePeerID(libp2p_identity::ParseError),
+    ParsePeerID(libp2p::identity::ParseError),
 }
 
 #[cfg(feature = "remote")]
-impl From<libp2p_identity::ParseError> for ActorIdFromBytesError {
-    fn from(err: libp2p_identity::ParseError) -> Self {
+impl From<libp2p::identity::ParseError> for ActorIdFromBytesError {
+    fn from(err: libp2p::identity::ParseError) -> Self {
         ActorIdFromBytesError::ParsePeerID(err)
     }
 }

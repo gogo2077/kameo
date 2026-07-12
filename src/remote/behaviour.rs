@@ -458,7 +458,7 @@ impl NetworkBehaviour for Behaviour {
                     ..
                 } in REMOTE_REGISTRY.lock().await.values()
                 {
-                    for linked_actor_id in (*links.lock().await).keys() {
+                    for linked_actor_id in links.lock().await.sibblings.keys() {
                         if linked_actor_id.peer_id() == Some(&peer_id) {
                             let signal_mailbox = signal_mailbox.clone();
                             let linked_actor_id = *linked_actor_id;
@@ -467,6 +467,8 @@ impl NetworkBehaviour for Behaviour {
                                     .signal_link_died(
                                         linked_actor_id,
                                         ActorStopReason::PeerDisconnected,
+                                        None,
+                                        None,
                                     )
                                     .await
                             });

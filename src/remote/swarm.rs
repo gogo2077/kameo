@@ -379,9 +379,10 @@ pub(crate) struct SwarmSender(mpsc::UnboundedSender<SwarmCommand>);
 
 impl SwarmSender {
     pub(crate) fn send(&self, cmd: SwarmCommand) {
-        self.0
-            .send(cmd)
-            .expect("the swarm should never stop running");
+        if self.0.send(cmd).is_err() {
+            #[cfg(feature = "tracing")]
+            tracing::warn!("failed to send swarm command: swarm channel closed");
+        }
     }
 
     fn send_with_reply<T>(

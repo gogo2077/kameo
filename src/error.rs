@@ -216,6 +216,7 @@ impl<M, E> SendError<M, SendError<M, E>> {
 
 impl BoxSendError {
     /// Downcasts the inner error types to a concrete type.
+    #[must_use]
     pub fn downcast<M, E>(self) -> SendError<M, E>
     where
         M: 'static,
@@ -339,13 +340,25 @@ impl<M, E> From<Elapsed> for SendError<M, E> {
     }
 }
 
-impl<M, E> error::Error for SendError<M, E> where E: fmt::Debug + fmt::Display {}
+impl<M, E> error::Error for SendError<M, E>
+where
+    E: error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        match *self {
+            Self::HandlerError(ref error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 /// Reason for an actor being stopped.
 #[derive(Clone, Serialize, Deserialize)]
 pub enum ActorStopReason {
     /// Actor stopped normally.
     Normal,
+    /// Supervisor restarted.
+    SupervisorRestart,
     /// Actor was killed.
     Killed,
     /// Actor panicked.
@@ -362,10 +375,26 @@ pub enum ActorStopReason {
     PeerDisconnected,
 }
 
+impl ActorStopReason {
+    /// Returns true if the actor's stop reason is normal and not caused by an error.
+    pub fn is_normal(&self) -> bool {
+        match self {
+            ActorStopReason::Normal => true,
+            ActorStopReason::SupervisorRestart
+            | ActorStopReason::Killed
+            | ActorStopReason::Panicked(_)
+            | ActorStopReason::LinkDied { .. } => false,
+            #[cfg(feature = "remote")]
+            ActorStopReason::PeerDisconnected => false,
+        }
+    }
+}
+
 impl fmt::Debug for ActorStopReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ActorStopReason::Normal => write!(f, "Normal"),
+            ActorStopReason::SupervisorRestart => write!(f, "SupervisorRestart"),
             ActorStopReason::Killed => write!(f, "Killed"),
             ActorStopReason::Panicked(err) => {
                 let mut dbg_struct = f.debug_struct("Panicked");
@@ -389,6 +418,7 @@ impl fmt::Display for ActorStopReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ActorStopReason::Normal => write!(f, "actor stopped normally"),
+            ActorStopReason::SupervisorRestart => write!(f, "actor restarted by supervisor"),
             ActorStopReason::Killed => write!(f, "actor was killed"),
             ActorStopReason::Panicked(err) => err.fmt(f),
             ActorStopReason::LinkDied { id, reason: _ } => {
@@ -662,6 +692,8 @@ pub enum PanicReason {
     OnLinkDied,
     /// The [`on_stop`](Actor::on_stop) lifecycle hook returned an error.
     OnStop,
+    /// The [`next`](Actor::next) lifecycle hook returned an error.
+    Next,
 }
 
 impl PanicReason {
@@ -717,6 +749,7 @@ impl fmt::Display for PanicReason {
             PanicReason::OnPanic => write!(f, "on_panic returned error"),
             PanicReason::OnLinkDied => write!(f, "on_link_died returned error"),
             PanicReason::OnStop => write!(f, "on_stop returned error"),
+            PanicReason::Next => write!(f, "next returned error"),
         }
     }
 }
@@ -781,6 +814,7 @@ impl Hash for Infallible {
 
 /// An error that can occur when registering & looking up actors by name.
 #[derive(Debug)]
+#[cfg_attr(not(feature = "remote"), derive(Clone))]
 pub enum RegistryError {
     /// The actor swarm has not been bootstrapped.
     #[cfg(feature = "remote")]

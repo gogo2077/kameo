@@ -8,6 +8,12 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-Dwarnings"
   CARGO_TERM_VERBOSE: true
+  # Retry crate downloads more aggressively to ride out transient crates.io
+  # HTTP/2 framing errors (rust-lang/cargo#6788).
+  CARGO_NET_RETRY: 10
+  # Force HTTP/1.1 for crate downloads; the framing errors originate in the
+  # HTTP/2 layer, so disabling multiplexing avoids them outright.
+  CARGO_HTTP_MULTIPLEXING: false
 
 jobs:
   build:
@@ -50,11 +56,19 @@ jobs:
             features: "--no-default-features --features macros,tracing,remote,metrics"
           - package: "kameo"
             features: "--all-features"
+          # kameo crate with the console feature (in isolation and a realistic combo)
+          - package: "kameo"
+            features: "--no-default-features --features console"
+          - package: "kameo"
+            features: "--no-default-features --features macros,tracing,console"
           # kameo_actors crate (no additional features)
           - package: "kameo_actors"
             features: ""
           # kameo_macros crate (no additional features)
           - package: "kameo_macros"
+            features: ""
+          # kameo_console crate (the TUI; no additional features)
+          - package: "kameo_console"
             features: ""
     steps:
       - uses: actions/checkout@v4
@@ -122,11 +136,19 @@ jobs:
             features: "--no-default-features --features macros,tracing,remote,metrics"
           - package: "kameo"
             features: "--all-features"
+          # kameo crate with the console feature (in isolation and a realistic combo)
+          - package: "kameo"
+            features: "--no-default-features --features console"
+          - package: "kameo"
+            features: "--no-default-features --features macros,tracing,console"
           # kameo_actors crate (no additional features)
           - package: "kameo_actors"
             features: ""
           # kameo_macros crate (no additional features)
           - package: "kameo_macros"
+            features: ""
+          # kameo_console crate (the TUI; no additional features)
+          - package: "kameo_console"
             features: ""
     steps:
       - uses: actions/checkout@v4
@@ -189,11 +211,19 @@ jobs:
             features: "--no-default-features --features macros,tracing,remote,metrics"
           - package: "kameo"
             features: "--all-features"
+          # kameo crate with the console feature (in isolation and a realistic combo)
+          - package: "kameo"
+            features: "--no-default-features --features console"
+          - package: "kameo"
+            features: "--no-default-features --features macros,tracing,console"
           # kameo_actors crate (no additional features)
           - package: "kameo_actors"
             features: ""
           # kameo_macros crate (no additional features)
           - package: "kameo_macros"
+            features: ""
+          # kameo_console crate (the TUI; no additional features)
+          - package: "kameo_console"
             features: ""
     steps:
       - uses: actions/checkout@v4

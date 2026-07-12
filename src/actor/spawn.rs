@@ -1,9 +1,11 @@
-use std::{convert, ops::ControlFlow, panic::AssertUnwindSafe, sync::Arc, thread};
+use std::{
+    collections::VecDeque, convert, ops::ControlFlow, panic::AssertUnwindSafe, sync::Arc, thread,
+    time::Duration,
+};
 
 use futures::{
-    FutureExt, StreamExt,
-    future::BoxFuture,
-    stream::{AbortHandle, AbortRegistration, Abortable, FuturesUnordered},
+    FutureExt,
+    stream::{AbortHandle, AbortRegistration, Abortable},
 };
 use tokio::{
     runtime::{Handle, RuntimeFlavor},
@@ -11,14 +13,15 @@ use tokio::{
     task::JoinHandle,
 };
 #[cfg(feature = "tracing")]
-use tracing::{error, trace};
+use tracing::{Instrument, error, trace};
 
 #[cfg(feature = "remote")]
 use crate::remote;
 
 use crate::{
-    actor::{Actor, ActorRef, CURRENT_ACTOR_ID, Link, Links, kind::ActorBehaviour},
+    actor::{Actor, ActorRef, CURRENT_ACTOR_ID, kind::ActorBehaviour},
     error::{ActorStopReason, PanicError, PanicReason, SendError, invoke_actor_error_hook},
+    links::Links,
     mailbox::{MailboxReceiver, MailboxSender, Signal},
 };
 
@@ -36,6 +39,8 @@ pub struct PreparedActor<A: Actor> {
     actor_ref: ActorRef<A>,
     mailbox_rx: MailboxReceiver<A>,
     abort_registration: AbortRegistration,
+    #[cfg(feature = "console")]
+    monitor: Arc<crate::console::registry::ActorMonitor>,
 }
 
 impl<A: Actor> PreparedActor<A> {
@@ -46,11 +51,23 @@ impl<A: Actor> PreparedActor<A> {
     ///
     /// This is typically created though [`Actor::prepare`](crate::actor::Spawn::prepare) and [`Actor::prepare_with_mailbox`](crate::actor::Spawn::prepare_with_mailbox).
     pub fn new((mailbox_tx, mailbox_rx): (MailboxSender<A>, MailboxReceiver<A>)) -> Self {
+        Self::new_with(
+            ActorId::generate(),
+            (mailbox_tx, mailbox_rx),
+            Links::default(),
+        )
+    }
+
+    pub(crate) fn new_with(
+        actor_id: ActorId,
+        (mailbox_tx, mailbox_rx): (MailboxSender<A>, MailboxReceiver<A>),
+        links: Links,
+    ) -> Self {
         let (abort_handle, abort_registration) = AbortHandle::new_pair();
-        let links = Links::default();
         let startup_result = Arc::new(SetOnce::new());
         let shutdown_result = Arc::new(SetOnce::new());
         let actor_ref = ActorRef::new(
+            actor_id,
             mailbox_tx,
             abort_handle,
             links,
@@ -58,18 +75,45 @@ impl<A: Actor> PreparedActor<A> {
             shutdown_result,
         );
 
+        #[cfg(feature = "console")]
+        let monitor = crate::console::registry::register_or_get::<A>(
+            actor_id,
+            actor_ref.mailbox_sender(),
+            &actor_ref.links,
+        );
+
         PreparedActor {
             actor_ref,
             mailbox_rx,
             abort_registration,
+            #[cfg(feature = "console")]
+            monitor,
         }
     }
 
     /// Returns a reference to the [`ActorRef`], which can be used to send messages to the actor.
     ///
     /// The `ActorRef` can be used for interaction before the actor starts processing its event loop.
+    ///
+    /// Note: if you intend to configure a [default reply timeout](PreparedActor::reply_timeout),
+    /// do so before cloning the ref out, as the value is read off the clone at the time it's made.
     pub fn actor_ref(&self) -> &ActorRef<A> {
         &self.actor_ref
+    }
+
+    /// Sets a default reply timeout applied to every `ask` request that doesn't specify its own.
+    ///
+    /// An `ask` whose handler doesn't reply within this duration resolves with a timeout error
+    /// instead of waiting forever. A timeout set at the call site with
+    /// [`AskRequest::reply_timeout`](crate::request::AskRequest::reply_timeout) always takes
+    /// precedence over this default. The default applies to async `ask` requests; the blocking
+    /// variants are unaffected.
+    ///
+    /// Configure this before cloning the [`ActorRef`] out (see [`PreparedActor::actor_ref`]),
+    /// otherwise the clone won't observe the default.
+    pub fn reply_timeout(mut self, duration: Duration) -> Self {
+        self.actor_ref.set_default_reply_timeout(Some(duration));
+        self
     }
 
     /// Runs the actor in the current context **without** spawning a separate task, until the actor is stopped.
@@ -109,6 +153,8 @@ impl<A: Actor> PreparedActor<A> {
             self.actor_ref,
             self.mailbox_rx,
             self.abort_registration,
+            #[cfg(feature = "console")]
+            self.monitor,
         )
         .await
     }
@@ -153,12 +199,12 @@ impl<A: Actor> PreparedActor<A> {
     }
 }
 
-#[inline]
 async fn run_actor_lifecycle<A>(
     args: A::Args,
     actor_ref: ActorRef<A>,
-    mailbox_rx: MailboxReceiver<A>,
+    mut mailbox_rx: MailboxReceiver<A>,
     abort_registration: AbortRegistration,
+    #[cfg(feature = "console")] monitor: Arc<crate::console::registry::ActorMonitor>,
 ) -> Result<(A, ActorStopReason), PanicError>
 where
     A: Actor,
@@ -166,101 +212,187 @@ where
     #[allow(unused_mut)]
     let mut id = actor_ref.id();
     let name = A::name();
-    #[cfg(feature = "tracing")]
-    trace!(%id, %name, "actor started");
 
-    let start_res = AssertUnwindSafe(A::on_start(args, actor_ref.clone()))
-        .catch_unwind()
-        .await
-        .map(|res| res.map_err(|err| PanicError::new(Box::new(err), PanicReason::OnStart)))
-        .map_err(|err| PanicError::new_from_panic_any(err, PanicReason::OnStart))
-        .and_then(convert::identity);
-    let startup_finished = matches!(
-        actor_ref.weak_signal_mailbox().signal_startup_finished(),
-        Err(SendError::MailboxFull(()))
-    );
+    #[cfg(feature = "console")]
+    let monitor_scope = Arc::clone(&monitor);
 
-    let actor_ref = actor_ref.into_downgrade();
+    let task = async move {
+        #[cfg(feature = "tracing")]
+        trace!(%id, %name, "actor started");
 
-    match start_res {
-        Ok(actor) => {
-            let mut state = ActorBehaviour::new_from_actor(actor, actor_ref.clone());
-
-            let reason = Abortable::new(
-                abortable_actor_loop(
-                    &mut state,
-                    mailbox_rx,
-                    &actor_ref.startup_result,
-                    startup_finished,
-                ),
-                abort_registration,
-            )
+        let start_res = AssertUnwindSafe(A::on_start(args, actor_ref.clone()))
+            .catch_unwind()
             .await
-            .unwrap_or(ActorStopReason::Killed);
+            .map(|res| res.map_err(|err| PanicError::new(Box::new(err), PanicReason::OnStart)))
+            .map_err(|err| PanicError::new_from_panic_any(err, PanicReason::OnStart))
+            .and_then(convert::identity);
+        let startup_finished = matches!(
+            actor_ref.weak_signal_mailbox().signal_startup_finished(),
+            Err(SendError::MailboxFull(()))
+        );
 
-            let mut actor = state.shutdown().await;
+        let actor_ref = actor_ref.into_downgrade();
 
-            let mut notify_futs = notify_links(id, &actor_ref.links, &reason).await;
+        match start_res {
+            Ok(actor) => {
+                let mut state = ActorBehaviour::new_from_actor(actor, actor_ref.clone());
 
-            log_actor_stop_reason(id, name, &reason);
-            let on_stop_res = actor.on_stop(actor_ref.clone(), reason.clone()).await;
-            while let Some(()) = notify_futs.next().await {}
+                #[cfg(feature = "console")]
+                monitor.set_running();
 
-            unregister_actor(&id).await;
+                let reason = Abortable::new(
+                    abortable_actor_loop(
+                        &mut state,
+                        &mut mailbox_rx,
+                        &actor_ref.startup_result,
+                        startup_finished,
+                        #[cfg(feature = "console")]
+                        &monitor,
+                    ),
+                    abort_registration,
+                )
+                .await
+                .unwrap_or(ActorStopReason::Killed);
 
-            match on_stop_res {
-                Ok(()) => {
-                    actor_ref
-                        .shutdown_result
-                        .set(Ok(()))
-                        .expect("nothing else should set the shutdown result");
+                #[cfg(feature = "console")]
+                monitor.set_stopping();
+
+                let mut actor = state.shutdown().await;
+                actor_ref.links.set_children_parent_shutdown().await;
+                actor_ref.links.send_children_shutdown().await;
+                drain_until_children_closed(&actor_ref.links, &mut mailbox_rx).await;
+                actor_ref
+                    .links
+                    .lock()
+                    .await
+                    .notify_links(id, reason.clone(), mailbox_rx);
+
+                log_actor_stop_reason(id, name, &reason);
+                let on_stop_res =
+                    AssertUnwindSafe(actor.on_stop(actor_ref.clone(), reason.clone()))
+                        .catch_unwind()
+                        .await
+                        .map(|res| {
+                            res.map_err(|err| PanicError::new(Box::new(err), PanicReason::OnStop))
+                        })
+                        .map_err(|err| PanicError::new_from_panic_any(err, PanicReason::OnStop))
+                        .and_then(convert::identity);
+
+                #[cfg(feature = "console")]
+                monitor.set_stopped(&reason);
+
+                unregister_actor(&id).await;
+
+                match on_stop_res {
+                    Ok(()) => {
+                        actor_ref
+                            .shutdown_result
+                            .set(Ok(reason.clone()))
+                            .expect("nothing else should set the shutdown result");
+                    }
+                    Err(err) => {
+                        invoke_actor_error_hook(&err);
+
+                        actor_ref
+                            .shutdown_result
+                            .set(Err(err))
+                            .expect("nothing else should set the shutdown result");
+                    }
                 }
-                Err(err) => {
-                    let err = PanicError::new(Box::new(err), PanicReason::OnStop);
-                    invoke_actor_error_hook(&err);
 
-                    actor_ref
-                        .shutdown_result
-                        .set(Err(err))
-                        .expect("nothing else should set the shutdown result");
-                }
+                Ok((actor, reason))
             }
+            Err(err) => {
+                actor_ref
+                    .startup_result
+                    .set(Err(err.clone()))
+                    .expect("nothing should set the startup result");
 
-            Ok((actor, reason))
+                let reason = ActorStopReason::Panicked(err);
+                log_actor_stop_reason(id, name, &reason);
+
+                actor_ref.links.set_children_parent_shutdown().await;
+                actor_ref.links.send_children_shutdown().await;
+                drain_until_children_closed(&actor_ref.links, &mut mailbox_rx).await;
+                actor_ref
+                    .links
+                    .lock()
+                    .await
+                    .notify_links(id, reason.clone(), mailbox_rx);
+
+                #[cfg(feature = "console")]
+                monitor.set_stopped(&reason);
+
+                unregister_actor(&id).await;
+
+                let ActorStopReason::Panicked(err) = reason else {
+                    unreachable!()
+                };
+
+                actor_ref
+                    .shutdown_result
+                    .set(Err(err.clone()))
+                    .expect("nothing should set the startup result");
+
+                Err(err)
+            }
         }
-        Err(err) => {
-            actor_ref
-                .startup_result
-                .set(Err(err.clone()))
-                .expect("nothing should set the startup result");
+    };
 
-            let reason = ActorStopReason::Panicked(err);
-            log_actor_stop_reason(id, name, &reason);
+    #[cfg(feature = "console")]
+    let task = crate::console::registry::with_monitor(monitor_scope, task);
 
-            let mut notify_futs = notify_links(id, &actor_ref.links, &reason).await;
-            while let Some(()) = notify_futs.next().await {}
+    #[cfg(not(feature = "tracing"))]
+    {
+        task.await
+    }
 
-            unregister_actor(&id).await;
+    #[cfg(feature = "tracing")]
+    {
+        let actor_span = tracing::info_span!("actor.lifecycle", actor.name = name, actor.id = %id);
+        task.instrument(actor_span).await
+    }
+}
 
-            let ActorStopReason::Panicked(err) = reason else {
-                unreachable!()
-            };
-
-            actor_ref
-                .shutdown_result
-                .set(Err(err.clone()))
-                .expect("nothing should set the startup result");
-
-            Err(err)
+/// Keeps the mailbox drained while waiting for supervised children to close their channels,
+/// preventing a child's notification from deadlocking on a full mailbox. Tells consumed during
+/// this window are preserved and re-queued so they survive a supervisor restart; asks have their
+/// reply sender dropped (caller receives `ActorStopped`), which unblocks any child awaiting a
+/// reply so it can finish shutting down.
+async fn drain_until_children_closed<A>(links: &Links, mailbox_rx: &mut MailboxReceiver<A>)
+where
+    A: Actor,
+{
+    let mut preserved = VecDeque::new();
+    let wait = links.wait_children_closed();
+    tokio::pin!(wait);
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut wait => break,
+            signal = mailbox_rx.recv() => match signal {
+                // tell: preserve for the restart
+                Some(signal @ Signal::Message { reply: None, .. }) => preserved.push_back(signal),
+                // ask: drop the reply sender so the caller gets `ActorStopped`
+                Some(Signal::Message { reply: Some(_), .. }) => {
+                    #[cfg(feature = "tracing")]
+                    tracing::debug!("dropping pending ask during restart drain, caller will receive ActorStopped");
+                }
+                // lifecycle / link-died signals during our own teardown: discard
+                Some(_) => {}
+                None => break,
+            }
         }
     }
+    mailbox_rx.push_front(preserved);
 }
 
 async fn abortable_actor_loop<A>(
     state: &mut ActorBehaviour<A>,
-    mut mailbox_rx: MailboxReceiver<A>,
+    mailbox_rx: &mut MailboxReceiver<A>,
     startup_result: &SetOnce<Result<(), PanicError>>,
     startup_finished: bool,
+    #[cfg(feature = "console")] monitor: &Arc<crate::console::registry::ActorMonitor>,
 ) -> ActorStopReason
 where
     A: Actor,
@@ -269,7 +401,14 @@ where
         return reason;
     }
     loop {
-        let reason = recv_mailbox_loop(state, &mut mailbox_rx, startup_result).await;
+        let reason = recv_mailbox_loop(
+            state,
+            mailbox_rx,
+            startup_result,
+            #[cfg(feature = "console")]
+            monitor,
+        )
+        .await;
         if let ControlFlow::Break(reason) = state.on_shutdown(reason).await {
             return reason;
         }
@@ -280,13 +419,24 @@ async fn recv_mailbox_loop<A>(
     state: &mut ActorBehaviour<A>,
     mailbox_rx: &mut MailboxReceiver<A>,
     startup_result: &SetOnce<Result<(), PanicError>>,
+    #[cfg(feature = "console")] monitor: &Arc<crate::console::registry::ActorMonitor>,
 ) -> ActorStopReason
 where
     A: Actor,
 {
     loop {
-        match state.next(mailbox_rx).await {
-            Some(Signal::StartupFinished) => {
+        let next = state.next(mailbox_rx).await;
+
+        #[cfg(feature = "console")]
+        {
+            monitor.set_mailbox_len(mailbox_rx.len());
+            if let ControlFlow::Continue(signal) = &next {
+                monitor.record_received(signal);
+            }
+        }
+
+        match next {
+            ControlFlow::Continue(Signal::StartupFinished) => {
                 if startup_result.set(Ok(())).is_err() {
                     #[cfg(feature = "tracing")]
                     error!("received startup finished signal after already being started up");
@@ -295,84 +445,55 @@ where
                     return reason;
                 }
             }
-            Some(Signal::Message {
+            ControlFlow::Continue(Signal::Message {
                 message,
                 actor_ref,
                 reply,
                 sent_within_actor,
+                message_name,
+                #[cfg(feature = "tracing")]
+                caller_span,
+            }) => {
+                #[cfg(feature = "console")]
+                monitor.begin_handler(message_name);
+                let result = state
+                    .handle_message(
+                        message,
+                        actor_ref,
+                        reply,
+                        sent_within_actor,
+                        message_name,
+                        #[cfg(feature = "tracing")]
+                        caller_span,
+                    )
+                    .await;
+                #[cfg(feature = "console")]
+                monitor.end_handler();
+                if let ControlFlow::Break(reason) = result {
+                    return reason;
+                }
+            }
+            ControlFlow::Continue(Signal::LinkDied {
+                id,
+                reason,
+                mailbox_rx,
+                dead_actor_sibblings,
             }) => {
                 if let ControlFlow::Break(reason) = state
-                    .handle_message(message, actor_ref, reply, sent_within_actor)
+                    .handle_link_died(id, reason, mailbox_rx, dead_actor_sibblings)
                     .await
                 {
                     return reason;
                 }
             }
-            Some(Signal::LinkDied { id, reason }) => {
-                if let ControlFlow::Break(reason) = state.handle_link_died(id, reason).await {
-                    return reason;
-                }
-            }
-            Some(Signal::Stop) | None => {
+            ControlFlow::Continue(Signal::Stop | Signal::SupervisorRestart) => {
                 if let ControlFlow::Break(reason) = state.handle_stop().await {
                     return reason;
                 }
             }
+            ControlFlow::Break(reason) => return reason,
         }
     }
-}
-
-async fn notify_links(
-    id: ActorId,
-    links: &Links,
-    reason: &ActorStopReason,
-) -> FuturesUnordered<BoxFuture<'static, ()>> {
-    let futs = FuturesUnordered::new();
-    {
-        let mut links = links.lock().await;
-        #[allow(unused_variables)]
-        for (link_actor_id, link) in links.drain() {
-            match link {
-                Link::Local(mailbox) => {
-                    let reason = reason.clone();
-                    futs.push(
-                        async move {
-                            if let Err(err) = mailbox.signal_link_died(id, reason).await {
-                                #[cfg(feature = "tracing")]
-                                error!("failed to notify actor a link died: {err}");
-                            }
-                        }
-                        .boxed(),
-                    );
-                }
-                #[cfg(feature = "remote")]
-                Link::Remote(notified_actor_remote_id) => {
-                    if let Some(swarm) = remote::ActorSwarm::get() {
-                        let reason = reason.clone();
-                        futs.push(
-                            async move {
-                                let res = swarm
-                                    .signal_link_died(
-                                        id,
-                                        link_actor_id,
-                                        notified_actor_remote_id,
-                                        reason,
-                                    )
-                                    .await;
-                                if let Err(err) = res {
-                                    #[cfg(feature = "tracing")]
-                                    error!("failed to notify actor a link died: {err}");
-                                }
-                            }
-                            .boxed(),
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    futs
 }
 
 #[allow(unused_variables)]
@@ -395,9 +516,10 @@ async fn unregister_actor(id: &ActorId) {
 #[cfg(feature = "tracing")]
 fn log_actor_stop_reason(id: ActorId, name: &str, reason: &ActorStopReason) {
     match reason {
-        reason @ ActorStopReason::Normal
-        | reason @ ActorStopReason::Killed
-        | reason @ ActorStopReason::LinkDied { .. } => {
+        reason @ (ActorStopReason::Normal
+        | ActorStopReason::SupervisorRestart
+        | ActorStopReason::Killed
+        | ActorStopReason::LinkDied { .. }) => {
             trace!(%id, %name, ?reason, "actor stopped");
         }
         reason @ ActorStopReason::Panicked(_) => {

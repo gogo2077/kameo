@@ -1,6 +1,7 @@
 use std::{future::IntoFuture, time::Duration};
 
 use futures::{FutureExt, future::BoxFuture};
+use tokio::task::JoinHandle;
 
 use crate::{
     Actor,
@@ -26,6 +27,7 @@ where
     actor_ref: &'a ActorRef<A>,
     msg: M,
     mailbox_timeout: Tm,
+    message_name: &'static str,
     #[cfg(all(debug_assertions, feature = "tracing"))]
     called_at: &'static std::panic::Location<'static>,
 }
@@ -49,6 +51,7 @@ where
             actor_ref,
             msg,
             mailbox_timeout: Tm::default(),
+            message_name: <A as Message<M>>::name(),
             #[cfg(all(debug_assertions, feature = "tracing"))]
             called_at,
         }
@@ -67,6 +70,7 @@ where
             actor_ref: self.actor_ref,
             msg: self.msg,
             mailbox_timeout: WithRequestTimeout(duration),
+            message_name: self.message_name,
             #[cfg(all(debug_assertions, feature = "tracing"))]
             called_at: self.called_at,
         }
@@ -82,6 +86,9 @@ where
             actor_ref: self.actor_ref.clone(),
             reply: None,
             sent_within_actor: self.actor_ref.is_current(),
+            message_name: self.message_name,
+            #[cfg(feature = "tracing")]
+            caller_span: tracing::Span::current(),
         };
 
         let tx = self.actor_ref.mailbox_sender();
@@ -94,10 +101,62 @@ where
             );
         }
 
+        // A bounded `tell` parks the sender until the mailbox has room; record that as a
+        // wait-for edge so the console can surface mailbox-capacity deadlocks. An unbounded
+        // send never waits, so it's left uninstrumented.
+        #[cfg(feature = "console")]
+        let _wait = tx.capacity().is_some().then(|| {
+            crate::console::registry::begin_wait(
+                self.actor_ref.id(),
+                crate::console::wire::WaitKind::Tell,
+            )
+        });
+
         match self.mailbox_timeout.into() {
             Some(timeout) => Ok(tx.send_timeout(signal, timeout).await?),
             None => Ok(tx.send(signal).await?),
         }
+    }
+
+    /// Sends a message to the actor after a delay.
+    ///
+    /// Returns a [`JoinHandle`] that can be used to cancel the scheduled send via
+    /// [`JoinHandle::abort`]. The handle can safely be ignored for fire-and-forget usage.
+    ///
+    /// Awaiting the handle will block until the delay has elapsed and the message
+    /// has been sent; this is rarely what you want.
+    pub fn send_after(self, duration: Duration) -> JoinHandle<Result<(), SendError<M>>>
+    where
+        Tm: Into<Option<Duration>>,
+    {
+        let signal = Signal::Message {
+            message: Box::new(self.msg),
+            actor_ref: self.actor_ref.clone(),
+            reply: None,
+            sent_within_actor: self.actor_ref.is_current(),
+            message_name: self.message_name,
+            #[cfg(feature = "tracing")]
+            caller_span: tracing::Span::current(),
+        };
+
+        let tx = self.actor_ref.mailbox_sender().clone();
+        if tx.capacity().is_some() {
+            #[cfg(all(debug_assertions, feature = "tracing"))]
+            warn_deadlock(
+                self.actor_ref,
+                "An actor is sending a `tell` request to itself using a bounded mailbox, which may lead to a deadlock. To avoid this, use `.try_send()`.",
+                self.called_at,
+            );
+        }
+        let mailbox_timeout = self.mailbox_timeout.into();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(duration).await;
+            match mailbox_timeout {
+                Some(timeout) => Ok(tx.send_timeout(signal, timeout).await?),
+                None => Ok(tx.send(signal).await?),
+            }
+        })
     }
 }
 
@@ -113,6 +172,9 @@ where
             actor_ref: self.actor_ref.clone(),
             reply: None,
             sent_within_actor: self.actor_ref.is_current(),
+            message_name: self.message_name,
+            #[cfg(feature = "tracing")]
+            caller_span: tracing::Span::current(),
         };
 
         Ok(self.actor_ref.mailbox_sender().try_send(signal)?)
@@ -125,6 +187,9 @@ where
             actor_ref: self.actor_ref.clone(),
             reply: None,
             sent_within_actor: self.actor_ref.is_current(),
+            message_name: self.message_name,
+            #[cfg(feature = "tracing")]
+            caller_span: tracing::Span::current(),
         };
 
         let tx = self.actor_ref.mailbox_sender();
@@ -785,12 +850,25 @@ mod tests {
                 _msg: Msg,
                 _ctx: &mut Context<Self, Self::Reply>,
             ) -> Self::Reply {
-                tokio::time::sleep(Duration::from_secs(10)).await;
+                tokio::time::sleep(Duration::from_secs(5)).await;
             }
         }
 
         let actor_ref = MyActor::spawn_with_mailbox(MyActor, mailbox::bounded(1));
-        assert_eq!(actor_ref.tell(Msg).try_send(), Ok(()));
+        actor_ref.wait_for_startup().await;
+        // We need enough messages to both (a) occupy the actor (sleeping 5s
+        // in the handler) and (b) fill the bounded channel.  Without hotpath
+        // the channel capacity is 1, so 2 messages suffice: the first is
+        // dequeued by the actor after the 2ms yield, the second stays queued.
+        #[cfg(not(feature = "hotpath"))]
+        let fill_count = 2;
+        #[cfg(feature = "hotpath")]
+        let fill_count = 4;
+        for _ in 0..fill_count {
+            assert_eq!(actor_ref.tell(Msg).try_send(), Ok(()));
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
         assert_eq!(
             actor_ref.tell(Msg).try_send(),
             Err(SendError::MailboxFull(Msg))
@@ -801,6 +879,9 @@ mod tests {
     }
 
     #[tokio::test]
+    // hotpath wraps the channel with a proxy on a separate background runtime, making the
+    // observable fill count non-deterministic; backpressure semantics are unchanged.
+    #[cfg_attr(feature = "hotpath", ignore)]
     async fn bounded_tell_requests_mailbox_timeout() -> Result<(), Box<dyn std::error::Error>> {
         struct MyActor;
 
@@ -831,39 +912,29 @@ mod tests {
             }
         }
 
+        tokio::time::pause();
         let actor_ref = MyActor::spawn_with_mailbox(MyActor, mailbox::bounded(1));
-        // Mailbox empty, will succeed
-        assert_eq!(
-            actor_ref
-                .tell(Sleep(Duration::from_millis(100)))
-                .mailbox_timeout(Duration::from_millis(10))
-                .send()
-                .await,
-            Ok(())
-        );
-        // Mailbox is empty, this will make there be one item in the mailbox
-        #[cfg(not(feature = "hotpath"))]
-        let fill_count = 1;
-        #[cfg(feature = "hotpath")]
-        let fill_count = 5;
-        for _ in 0..fill_count {
-            assert_eq!(
-                actor_ref
-                    .tell(Sleep(Duration::from_millis(100)))
-                    .mailbox_timeout(Duration::from_millis(10))
-                    .send()
-                    .await,
-                Ok(())
-            );
+        actor_ref.wait_for_startup().await;
+        // The handler sleep must be longer than the mailbox timeout: tokio's test runtime
+        // auto-advances to the next timer when all tasks are blocked, so if the actor's sleep
+        // fires before the mailbox timeout the actor drains the buffer and the send succeeds.
+        let handler_sleep = Duration::from_secs(5);
+        for _ in 0..2 {
+            assert_eq!(actor_ref.tell(Sleep(handler_sleep)).try_send(), Ok(()));
+            tokio::time::advance(Duration::from_millis(1)).await;
         }
-        // Finally, this one will fail because there's one item in the mailbox already.
-        assert_eq!(
-            actor_ref
-                .tell(Sleep(Duration::from_millis(100)))
+        let actor_ref2 = actor_ref.clone();
+        let timeout_task = tokio::spawn(async move {
+            actor_ref2
+                .tell(Sleep(handler_sleep))
                 .mailbox_timeout(Duration::from_millis(50))
                 .send()
-                .await,
-            Err(SendError::Timeout(Some(Sleep(Duration::from_millis(100)))))
+                .await
+        });
+        tokio::time::advance(Duration::from_millis(51)).await;
+        assert_eq!(
+            timeout_task.await?,
+            Err(SendError::Timeout(Some(Sleep(handler_sleep))))
         );
         actor_ref.kill();
 

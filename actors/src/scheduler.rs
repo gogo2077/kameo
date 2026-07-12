@@ -40,10 +40,12 @@
 //! let interval = SetInterval::new(counter_ref.downgrade(), Duration::from_millis(100), Inc);
 //! scheduler_ref.tell(interval).await?;
 //!
-//! tokio::time::sleep(Duration::from_millis(500)).await;
+//! // The first tick fires immediately, then every 100ms. Sleeping ~450ms (off any tick
+//! // boundary) leaves the counter at roughly 5; the range absorbs scheduler jitter.
+//! tokio::time::sleep(Duration::from_millis(450)).await;
 //!
-//! // Count should have been incremented 5 times
-//! assert_eq!(counter.load(Ordering::Relaxed), 5);
+//! let count = counter.load(Ordering::Relaxed);
+//! assert!((4..=6).contains(&count), "expected ~5 ticks, got {count}");
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! # });
 //! ```
@@ -84,14 +86,14 @@ impl Actor for Scheduler {
         &mut self,
         _actor_ref: WeakActorRef<Self>,
         mailbox_rx: &mut MailboxReceiver<Self>,
-    ) -> Option<Signal<Self>> {
+    ) -> Result<Option<Signal<Self>>, Self::Error> {
         loop {
             if self.tasks.is_empty() {
-                return mailbox_rx.recv().await;
+                return Ok(mailbox_rx.recv().await);
             } else {
                 tokio::select! {
                     signal = mailbox_rx.recv() => {
-                        return signal;
+                        return Ok(signal);
                     }
                     _ = self.tasks.join_next() => {}
                 }

@@ -6,7 +6,10 @@
 #![deny(unused_must_use)]
 
 pub mod actor;
+#[cfg(feature = "console")]
+pub mod console;
 pub mod error;
+pub(crate) mod links;
 pub mod mailbox;
 pub mod message;
 #[cfg(not(feature = "remote"))]
@@ -15,11 +18,15 @@ pub mod registry;
 pub mod remote;
 pub mod reply;
 pub mod request;
+pub mod supervision;
 
 pub use actor::Actor;
 #[cfg(feature = "macros")]
 pub use kameo_macros::{Actor, RemoteActor, Reply, messages, remote_message};
 pub use reply::Reply;
+
+#[cfg(all(feature = "otel", not(feature = "tracing")))]
+compile_error!("the `otel` feature requires the `tracing` feature to be enabled");
 
 /// Commonly used types and functions that can be imported with a single use statement.
 ///

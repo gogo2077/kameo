@@ -23,6 +23,7 @@ use crate::{
     error::{ActorStopReason, PanicError, PanicReason, SendError, invoke_actor_error_hook},
     links::Links,
     mailbox::{MailboxReceiver, MailboxSender, Signal},
+    message::BoxMessage,
 };
 
 use super::ActorId;
@@ -76,11 +77,7 @@ impl<A: Actor> PreparedActor<A> {
         );
 
         #[cfg(feature = "console")]
-        let monitor = crate::console::registry::register_or_get::<A>(
-            actor_id,
-            actor_ref.mailbox_sender(),
-            &actor_ref.links,
-        );
+        let monitor = crate::console::registry::register_or_get(&actor_ref);
 
         PreparedActor {
             actor_ref,
@@ -260,7 +257,34 @@ where
                 let mut actor = state.shutdown().await;
                 actor_ref.links.set_children_parent_shutdown().await;
                 actor_ref.links.send_children_shutdown().await;
-                drain_until_children_closed(&actor_ref.links, &mut mailbox_rx).await;
+                let is_restarting = actor_ref.links.lock().await.will_restart(&reason);
+                drain_until_children_closed(&actor_ref.links, &mut mailbox_rx, is_restarting).await;
+
+                // On a terminal stop (not a restart, where the mailbox is reused by the next
+                // incarnation) hand any leftover tells to `on_undelivered` before `notify_links`
+                // drops them.
+                if !is_restarting {
+                    let undelivered = drain_undelivered(&mut mailbox_rx);
+                    if !undelivered.is_empty() {
+                        let res =
+                            AssertUnwindSafe(actor.on_undelivered(reason.clone(), undelivered))
+                                .catch_unwind()
+                                .await
+                                .map(|res| {
+                                    res.map_err(|err| {
+                                        PanicError::new(Box::new(err), PanicReason::OnUndelivered)
+                                    })
+                                })
+                                .map_err(|err| {
+                                    PanicError::new_from_panic_any(err, PanicReason::OnUndelivered)
+                                })
+                                .and_then(convert::identity);
+                        if let Err(err) = res {
+                            invoke_actor_error_hook(&err);
+                        }
+                    }
+                }
+
                 actor_ref
                     .links
                     .lock()
@@ -313,7 +337,9 @@ where
 
                 actor_ref.links.set_children_parent_shutdown().await;
                 actor_ref.links.send_children_shutdown().await;
-                drain_until_children_closed(&actor_ref.links, &mut mailbox_rx).await;
+                // startup failed; the supervisor may still restart us per policy
+                let is_restarting = actor_ref.links.lock().await.will_restart(&reason);
+                drain_until_children_closed(&actor_ref.links, &mut mailbox_rx, is_restarting).await;
                 actor_ref
                     .links
                     .lock()
@@ -356,11 +382,16 @@ where
 
 /// Keeps the mailbox drained while waiting for supervised children to close their channels,
 /// preventing a child's notification from deadlocking on a full mailbox. Tells consumed during
-/// this window are preserved and re-queued so they survive a supervisor restart; asks have their
-/// reply sender dropped (caller receives `ActorStopped`), which unblocks any child awaiting a
-/// reply so it can finish shutting down.
-async fn drain_until_children_closed<A>(links: &Links, mailbox_rx: &mut MailboxReceiver<A>)
-where
+/// this window are preserved and re-queued so they survive a supervisor restart. Asks are bounced
+/// back to their caller with the original message so nothing queued is silently dropped: on a
+/// restart the caller receives `ActorRestarting` (safe to retry against the new incarnation), on a
+/// terminal stop `ActorNotRunning`. Either way any child awaiting a reply is unblocked so it can
+/// finish shutting down.
+async fn drain_until_children_closed<A>(
+    links: &Links,
+    mailbox_rx: &mut MailboxReceiver<A>,
+    is_restarting: bool,
+) where
     A: Actor,
 {
     let mut preserved = VecDeque::new();
@@ -373,10 +404,15 @@ where
             signal = mailbox_rx.recv() => match signal {
                 // tell: preserve for the restart
                 Some(signal @ Signal::Message { reply: None, .. }) => preserved.push_back(signal),
-                // ask: drop the reply sender so the caller gets `ActorStopped`
-                Some(Signal::Message { reply: Some(_), .. }) => {
-                    #[cfg(feature = "tracing")]
-                    tracing::debug!("dropping pending ask during restart drain, caller will receive ActorStopped");
+                // ask: bounce the message back so it isn't dropped; label it by whether we expect
+                // to restart (`ActorRestarting`, retry-safe) or stop for good (`ActorNotRunning`)
+                Some(Signal::Message { reply: Some(tx), message, .. }) => {
+                    let err = if is_restarting {
+                        SendError::ActorRestarting(message.as_any())
+                    } else {
+                        SendError::ActorNotRunning(message.as_any())
+                    };
+                    let _ = tx.send(Err(err));
                 }
                 // lifecycle / link-died signals during our own teardown: discard
                 Some(_) => {}
@@ -385,6 +421,35 @@ where
         }
     }
     mailbox_rx.push_front(preserved);
+}
+
+/// Drains every message remaining in the mailbox on a terminal stop, returning the leftover tells
+/// for [`Actor::on_undelivered`]. Straggler asks are bounced back to their caller with the original
+/// message (`ActorNotRunning`), mirroring [`drain_until_children_closed`], so they aren't handed to
+/// the hook or silently dropped.
+fn drain_undelivered<A>(mailbox_rx: &mut MailboxReceiver<A>) -> Vec<BoxMessage<A>>
+where
+    A: Actor,
+{
+    let mut undelivered = Vec::new();
+    while let Ok(signal) = mailbox_rx.try_recv() {
+        match signal {
+            Signal::Message {
+                message,
+                reply: None,
+                ..
+            } => undelivered.push(message),
+            Signal::Message {
+                message,
+                reply: Some(tx),
+                ..
+            } => {
+                let _ = tx.send(Err(SendError::ActorNotRunning(message.as_any())));
+            }
+            _ => {}
+        }
+    }
+    undelivered
 }
 
 async fn abortable_actor_loop<A>(
@@ -488,6 +553,15 @@ where
             }
             ControlFlow::Continue(Signal::Stop | Signal::SupervisorRestart) => {
                 if let ControlFlow::Break(reason) = state.handle_stop().await {
+                    return reason;
+                }
+            }
+            ControlFlow::Continue(Signal::Callback {
+                actor_ref,
+                callback,
+            }) => {
+                if let ControlFlow::Break(reason) = state.handle_callback(actor_ref, callback).await
+                {
                     return reason;
                 }
             }

@@ -17,10 +17,10 @@ use std::{
 };
 
 use crate::{
-    actor::{Actor, ActorId},
+    actor::{Actor, ActorId, ActorRef, WeakActorRef},
     error::ActorStopReason,
     links::Links,
-    mailbox::{MailboxSender, Signal, WeakMailboxSender},
+    mailbox::Signal,
     supervision::{RestartPolicy, SupervisionStrategy},
 };
 
@@ -56,17 +56,17 @@ trait LiveProbe: Send + Sync {
     fn live_mailbox_len(&self) -> Option<usize>;
 }
 
-impl<A: Actor> LiveProbe for WeakMailboxSender<A> {
+impl<A: Actor> LiveProbe for WeakActorRef<A> {
     fn strong_count(&self) -> usize {
-        WeakMailboxSender::strong_count(self)
+        WeakActorRef::strong_count(self)
     }
 
     fn weak_count(&self) -> usize {
-        WeakMailboxSender::weak_count(self)
+        WeakActorRef::weak_count(self)
     }
 
     fn live_mailbox_len(&self) -> Option<usize> {
-        let tx = self.upgrade()?;
+        let tx = self.mailbox_sender().upgrade()?;
         Some(tx.max_capacity()?.saturating_sub(tx.capacity()?))
     }
 }
@@ -149,7 +149,9 @@ pub(crate) struct ActorMonitor {
     mailbox_kind: wire::MailboxKind,
     mailbox_capacity: Option<usize>,
     links: Links,
-    probe: Box<dyn LiveProbe>,
+    /// Swapped out on restart: each incarnation has its own `ActorRef` allocation, so the
+    /// probe must track the latest one for its handle counts to stay meaningful.
+    probe: Mutex<Box<dyn LiveProbe>>,
     status: AtomicU8,
     stopped: Mutex<Option<Stopped>>,
     current_handler: Mutex<Option<CurrentHandler>>,
@@ -208,9 +210,10 @@ impl ActorMonitor {
     pub(crate) fn record_received<A: Actor>(&self, signal: &Signal<A>) {
         let counter = match signal {
             Signal::Message { .. } => &self.messages_received,
-            Signal::StartupFinished | Signal::Stop | Signal::SupervisorRestart => {
-                &self.lifecycle_signals_received
-            }
+            Signal::StartupFinished
+            | Signal::Stop
+            | Signal::SupervisorRestart
+            | Signal::Callback { .. } => &self.lifecycle_signals_received,
             Signal::LinkDied { .. } => &self.link_died_signals_received,
         };
         counter.fetch_add(1, Ordering::Relaxed);
@@ -246,9 +249,9 @@ impl ActorMonitor {
                     .get(&self.id)
                     .map(|spec| wire::SupervisionInfo {
                         policy: wire_policy(spec.restart_policy),
-                        max_restarts: spec.max_restarts,
-                        restart_window: spec.restart_window,
-                        restart_count: spec.restart_count,
+                        max_restarts: spec.restart_tracker.max_restarts(),
+                        restart_window: spec.restart_tracker.restart_window(),
+                        restart_count: spec.restart_tracker.current_count(),
                     })
             }
             None => None,
@@ -265,6 +268,15 @@ impl ActorMonitor {
                 .collect();
             counts.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
             counts
+        };
+
+        let (live_mailbox_len, ref_strong, ref_weak) = {
+            let probe = self.probe.lock().unwrap();
+            (
+                probe.live_mailbox_len(),
+                probe.strong_count(),
+                probe.weak_count(),
+            )
         };
 
         let is_supervisor = !Vec::is_empty(&children);
@@ -309,17 +321,14 @@ impl ActorMonitor {
                 kind: self.mailbox_kind,
                 // Prefer the live depth for bounded mailboxes (accurate even mid slow handler);
                 // fall back to the cached value for unbounded or already-dropped ones.
-                len: self
-                    .probe
-                    .live_mailbox_len()
-                    .unwrap_or_else(|| self.mailbox_len.load(Ordering::Relaxed)),
+                len: live_mailbox_len.unwrap_or_else(|| self.mailbox_len.load(Ordering::Relaxed)),
                 capacity: self.mailbox_capacity,
             },
             counters: self.wire_counters(),
             message_types,
             refs: wire::RefCounts {
-                strong: self.probe.strong_count(),
-                weak: self.probe.weak_count(),
+                strong: ref_strong,
+                weak: ref_weak,
             },
             links: wire::Links {
                 parent: parent_id.map(wire_id),
@@ -360,11 +369,9 @@ impl ActorMonitor {
 
 /// Registers a freshly prepared actor, or — when the id already exists — records a restart
 /// of the same logical actor (its id and mailbox are reused across supervised restarts).
-pub(crate) fn register_or_get<A: Actor>(
-    id: ActorId,
-    mailbox_tx: &MailboxSender<A>,
-    links: &Links,
-) -> Arc<ActorMonitor> {
+pub(crate) fn register_or_get<A: Actor>(actor_ref: &ActorRef<A>) -> Arc<ActorMonitor> {
+    let id = actor_ref.id();
+    let mailbox_tx = actor_ref.mailbox_sender();
     let mut registry = REGISTRY.lock().unwrap();
     if let Some(monitor) = registry.get(&id) {
         monitor.restarts.fetch_add(1, Ordering::Relaxed);
@@ -374,6 +381,8 @@ pub(crate) fn register_or_get<A: Actor>(
         // handler here — otherwise the restarted actor would show as forever handling the old
         // message (an ever-growing "Stuck" elapsed).
         *monitor.current_handler.lock().unwrap() = None;
+        // The new incarnation is a new allocation; repoint the probe so handle counts track it.
+        *monitor.probe.lock().unwrap() = Box::new(actor_ref.downgrade());
         monitor.status.store(RESTARTING, Ordering::Relaxed);
         return Arc::clone(monitor);
     }
@@ -399,8 +408,8 @@ pub(crate) fn register_or_get<A: Actor>(
             None => wire::MailboxKind::Unbounded,
         },
         mailbox_capacity: mailbox_tx.max_capacity(),
-        links: links.clone(),
-        probe: Box::new(mailbox_tx.downgrade()),
+        links: actor_ref.links().clone(),
+        probe: Mutex::new(Box::new(actor_ref.downgrade())),
         status: AtomicU8::new(STARTING),
         stopped: Mutex::new(None),
         current_handler: Mutex::new(None),

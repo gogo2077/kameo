@@ -91,6 +91,9 @@ pub enum SendError<M = (), E = Infallible> {
     ActorNotRunning(M),
     /// The actor panicked or was stopped before a reply could be received.
     ActorStopped,
+    /// The actor is restarting; the message was pulled during the restart drain and never
+    /// handled. The returned message is the original, safe to retry against the new incarnation.
+    ActorRestarting(M),
     /// The actors mailbox is full.
     MailboxFull(M),
     /// An error returned by the actor's message handler.
@@ -108,6 +111,7 @@ impl<M, E> SendError<M, E> {
         match self {
             SendError::ActorNotRunning(msg) => SendError::ActorNotRunning(f(msg)),
             SendError::ActorStopped => SendError::ActorStopped,
+            SendError::ActorRestarting(msg) => SendError::ActorRestarting(f(msg)),
             SendError::MailboxFull(msg) => SendError::MailboxFull(f(msg)),
             SendError::HandlerError(err) => SendError::HandlerError(err),
             SendError::Timeout(msg) => SendError::Timeout(msg.map(f)),
@@ -122,6 +126,7 @@ impl<M, E> SendError<M, E> {
         match self {
             SendError::ActorNotRunning(msg) => SendError::ActorNotRunning(msg),
             SendError::ActorStopped => SendError::ActorStopped,
+            SendError::ActorRestarting(msg) => SendError::ActorRestarting(msg),
             SendError::MailboxFull(msg) => SendError::MailboxFull(msg),
             SendError::HandlerError(err) => SendError::HandlerError(op(err)),
             SendError::Timeout(msg) => SendError::Timeout(msg),
@@ -137,6 +142,7 @@ impl<M, E> SendError<M, E> {
         match self {
             SendError::ActorNotRunning(err) => SendError::ActorNotRunning(Box::new(err)),
             SendError::ActorStopped => SendError::ActorStopped,
+            SendError::ActorRestarting(err) => SendError::ActorRestarting(Box::new(err)),
             SendError::MailboxFull(msg) => SendError::MailboxFull(Box::new(msg)),
             SendError::HandlerError(err) => SendError::HandlerError(Box::new(err)),
             SendError::Timeout(msg) => {
@@ -149,6 +155,7 @@ impl<M, E> SendError<M, E> {
     pub fn msg(self) -> Option<M> {
         match self {
             SendError::ActorNotRunning(msg) => Some(msg),
+            SendError::ActorRestarting(msg) => Some(msg),
             SendError::MailboxFull(msg) => Some(msg),
             SendError::Timeout(msg) => msg,
             _ => None,
@@ -203,6 +210,10 @@ impl<M, E> SendError<M, SendError<M, E>> {
             SendError::ActorStopped | SendError::HandlerError(SendError::ActorStopped) => {
                 SendError::ActorStopped
             }
+            SendError::ActorRestarting(msg)
+            | SendError::HandlerError(SendError::ActorRestarting(msg)) => {
+                SendError::ActorRestarting(msg)
+            }
             SendError::MailboxFull(msg) | SendError::HandlerError(SendError::MailboxFull(msg)) => {
                 SendError::MailboxFull(msg)
             }
@@ -236,6 +247,9 @@ impl BoxSendError {
                 *err.downcast::<M>().map_err(SendError::ActorNotRunning)?,
             )),
             SendError::ActorStopped => Ok(SendError::ActorStopped),
+            SendError::ActorRestarting(err) => Ok(SendError::ActorRestarting(
+                *err.downcast::<M>().map_err(SendError::ActorRestarting)?,
+            )),
             SendError::MailboxFull(err) => Ok(SendError::MailboxFull(
                 *err.downcast().map_err(SendError::MailboxFull)?,
             )),
@@ -262,6 +276,7 @@ where
         match self {
             SendError::ActorNotRunning(_) => write!(f, "ActorNotRunning"),
             SendError::ActorStopped => write!(f, "ActorStopped"),
+            SendError::ActorRestarting(_) => write!(f, "ActorRestarting"),
             SendError::MailboxFull(_) => write!(f, "MailboxFull"),
             SendError::HandlerError(err) => err.fmt(f),
             SendError::Timeout(_) => write!(f, "Timeout"),
@@ -277,6 +292,7 @@ where
         match self {
             SendError::ActorNotRunning(_) => write!(f, "actor not running"),
             SendError::ActorStopped => write!(f, "actor stopped"),
+            SendError::ActorRestarting(_) => write!(f, "actor restarting"),
             SendError::MailboxFull(_) => write!(f, "mailbox full"),
             SendError::HandlerError(err) => err.fmt(f),
             SendError::Timeout(_) => write!(f, "timeout"),
@@ -361,7 +377,15 @@ pub enum ActorStopReason {
     SupervisorRestart,
     /// Actor was killed.
     Killed,
-    /// Actor panicked.
+    /// Actor stopped due to a fault.
+    ///
+    /// This covers two cases, both handled through the same
+    /// [`on_panic`](crate::actor::Actor::on_panic) hook:
+    ///
+    /// - A genuine unwinding panic in a message handler.
+    /// - An error returned from a lifecycle hook or `on_message`.
+    ///
+    /// Use [`PanicError::reason`] (or [`PanicError::is_panic`]) to tell them apart.
     Panicked(PanicError),
     /// Link died.
     LinkDied {
@@ -454,6 +478,11 @@ where
 impl<E> error::Error for HookError<E> where E: error::Error {}
 
 /// A shared error that occurs when an actor panics or returns an error from a hook in the [Actor] trait.
+///
+/// This merges two kinds of fault: a genuine unwinding panic in a message
+/// handler, and an error returned from a lifecycle hook or `on_message`. Call
+/// [`reason`](PanicError::reason) for the specific [`PanicReason`], or
+/// [`is_panic`](PanicError::is_panic) to check whether it was a real panic.
 #[derive(Clone)]
 pub struct PanicError {
     pub(crate) err: Arc<Mutex<Box<dyn ReplyError>>>,
@@ -482,6 +511,14 @@ impl PanicError {
     /// Returns the reason for the panic.
     pub fn reason(&self) -> PanicReason {
         self.reason
+    }
+
+    /// Returns `true` if this was a genuine unwinding panic in a message handler,
+    /// rather than an error returned from a lifecycle hook or `on_message`.
+    ///
+    /// This is a shorthand for `self.reason() == PanicReason::HandlerPanic`.
+    pub fn is_panic(&self) -> bool {
+        matches!(self.reason, PanicReason::HandlerPanic)
     }
 
     /// Calls the passed closure `f` with an option containing the boxed any type downcast into a string,
@@ -692,6 +729,8 @@ pub enum PanicReason {
     OnLinkDied,
     /// The [`on_stop`](Actor::on_stop) lifecycle hook returned an error.
     OnStop,
+    /// The [`on_undelivered`](Actor::on_undelivered) lifecycle hook returned an error.
+    OnUndelivered,
     /// The [`next`](Actor::next) lifecycle hook returned an error.
     Next,
 }
@@ -718,6 +757,7 @@ impl PanicReason {
                 | PanicReason::OnPanic
                 | PanicReason::OnLinkDied
                 | PanicReason::OnStop
+                | PanicReason::OnUndelivered
         )
     }
 
@@ -749,6 +789,7 @@ impl fmt::Display for PanicReason {
             PanicReason::OnPanic => write!(f, "on_panic returned error"),
             PanicReason::OnLinkDied => write!(f, "on_link_died returned error"),
             PanicReason::OnStop => write!(f, "on_stop returned error"),
+            PanicReason::OnUndelivered => write!(f, "on_undelivered returned error"),
             PanicReason::Next => write!(f, "next returned error"),
         }
     }
@@ -1066,6 +1107,7 @@ impl<M, E> From<SendError<M, E>> for RemoteSendError<E> {
         match err {
             SendError::ActorNotRunning(_) => RemoteSendError::ActorNotRunning,
             SendError::ActorStopped => RemoteSendError::ActorStopped,
+            SendError::ActorRestarting(_) => RemoteSendError::ActorNotRunning,
             SendError::MailboxFull(_) => RemoteSendError::MailboxFull,
             SendError::HandlerError(err) => RemoteSendError::HandlerError(err),
             SendError::Timeout(_) => RemoteSendError::ReplyTimeout,

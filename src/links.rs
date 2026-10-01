@@ -38,6 +38,24 @@ pub type ShutdownFn = Box<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
 pub struct Links(Arc<Mutex<LinksInner>>);
 
 impl Links {
+    /// Creates links for a supervised child, pre-populated with the restart configuration its
+    /// supervisor shares with it: the `restart_policy`, the shared `restart_tracker` (so the child
+    /// can predict its own restarts in [`LinksInner::will_restart`]), and the shared
+    /// `parent_shutdown` flag. Building the inner value up front avoids locking it right after
+    /// construction.
+    pub fn supervised(
+        restart_policy: RestartPolicy,
+        restart_tracker: Arc<RestartTracker>,
+        parent_shutdown: Arc<AtomicBool>,
+    ) -> Self {
+        Links(Arc::new(Mutex::new(LinksInner {
+            restart_policy: Some(restart_policy),
+            restart_tracker: Some(restart_tracker),
+            parent_shutdown,
+            ..Default::default()
+        })))
+    }
+
     /// Sets the `parent_shutdown` flag on all supervised children.
     ///
     /// This must be called before the parent stops processing its mailbox so that any child
@@ -91,9 +109,54 @@ pub struct LinksInner {
     /// instead of queuing it in the parent's mailbox, which would deadlock the parent's
     /// `shutdown_children` wait.
     pub parent_shutdown: Arc<AtomicBool>,
+    /// The restart policy our supervisor will apply to us, `Some` only when supervised. Lets the
+    /// actor determine, during its own teardown, whether it will be restarted (see
+    /// [`Self::will_restart`]).
+    pub restart_policy: Option<RestartPolicy>,
+    /// The restart intensity bookkeeping, shared by `Arc` with our supervisor's [`ErasedChildSpec`].
+    /// `Some` only when supervised. Lets [`Self::will_restart`] apply the same restart-limit check
+    /// the supervisor uses, instead of guessing.
+    pub restart_tracker: Option<Arc<RestartTracker>>,
 }
 
 impl LinksInner {
+    /// Determines, during the actor's own teardown, whether its supervisor will restart it.
+    /// Mirrors [`ErasedChildSpec::should_restart`], reading the same shared [`RestartTracker`] so
+    /// the restart-limit check matches the supervisor's decision. `run_actor_lifecycle` uses this
+    /// both to route a dropped `ask`'s message (`ActorRestarting` vs `ActorNotRunning`) and to
+    /// decide whether leftover tells go to `Actor::on_undelivered`, so it must not report a restart
+    /// that won't happen.
+    ///
+    /// The child reads the tracker slightly before the supervisor decides. Because the restart
+    /// count only changes on the supervisor's restart path (which hasn't run yet for this death)
+    /// and `now - last_restart` is monotonic, the only possible disagreement is at a restart-window
+    /// boundary, where the child predicts no restart but the supervisor restarts: the leftover
+    /// tells reach `on_undelivered` instead of the new incarnation. No message is dropped either
+    /// way. The opposite (predict restart, supervisor declines) cannot occur.
+    pub fn will_restart(&self, reason: &ActorStopReason) -> bool {
+        let Some(policy) = self.restart_policy else {
+            return false; // unsupervised: nobody will restart us
+        };
+        if self.parent_shutdown.load(Ordering::Acquire) {
+            return false; // our supervisor is going away too
+        }
+        match policy {
+            RestartPolicy::Never => false,
+            // a coordinator-initiated restart bypasses the intensity check, same as the supervisor
+            _ if matches!(reason, ActorStopReason::SupervisorRestart) => true,
+            RestartPolicy::Permanent => self.restart_intensity_allows(),
+            RestartPolicy::Transient => !reason.is_normal() && self.restart_intensity_allows(),
+        }
+    }
+
+    /// Whether the shared restart budget still permits a restart. Falls back to `true`
+    /// if no tracker is set, which shouldn't happen while supervised.
+    fn restart_intensity_allows(&self) -> bool {
+        self.restart_tracker
+            .as_ref()
+            .is_none_or(|tracker| tracker.predict_restart())
+    }
+
     /// Notify parent or sibblings, depending on supervision status.
     pub fn notify_links<A: Actor>(
         &mut self,
@@ -216,14 +279,13 @@ pub struct ErasedChildSpec {
     /// its `mailbox_rx` immediately rather than forwarding it to the parent's queue.
     pub parent_shutdown: Arc<AtomicBool>,
     pub restart_policy: RestartPolicy,
-    pub restart_count: u32,
-    pub last_restart: Instant,
-    pub max_restarts: u32,
-    pub restart_window: Duration,
+    /// Restart intensity bookkeeping, shared by `Arc` with the child's
+    /// [`LinksInner::restart_tracker`] so the child can predict this same decision.
+    pub restart_tracker: Arc<RestartTracker>,
 }
 
 impl ErasedChildSpec {
-    pub fn should_restart(&mut self, reason: &ActorStopReason) -> ControlFlow<NoRestartReason> {
+    pub fn should_restart(&self, reason: &ActorStopReason) -> ControlFlow<NoRestartReason> {
         // Never policy takes precedence over everything, including coordinator-initiated restarts
         if matches!(self.restart_policy, RestartPolicy::Never) {
             return ControlFlow::Break(NoRestartReason::NeverPolicy);
@@ -244,24 +306,91 @@ impl ErasedChildSpec {
             RestartPolicy::Never => unreachable!(),
         }
 
+        self.restart_tracker.record_restart()
+    }
+}
+
+/// Restart intensity bookkeeping for a supervised child, shared by `Arc` between the supervisor's
+/// [`ErasedChildSpec`] and the child's [`LinksInner`]. The supervisor mutates it authoritatively
+/// via [`Self::record_restart`]; the child reads it via [`Self::predict_restart`] to decide, during
+/// its own teardown, whether it is about to be restarted.
+#[derive(Debug)]
+pub struct RestartTracker {
+    max_restarts: u32,
+    restart_window: Duration,
+    // std Mutex: only ever locked for the short, non-async body of the methods below, and
+    // independent of the async `Links` mutexes, so it can't deadlock against them.
+    state: std::sync::Mutex<RestartTrackerState>,
+}
+
+#[derive(Debug)]
+struct RestartTrackerState {
+    restart_count: u32,
+    last_restart: Instant,
+}
+
+impl RestartTracker {
+    pub fn new(max_restarts: u32, restart_window: Duration) -> Self {
+        RestartTracker {
+            max_restarts,
+            restart_window,
+            state: std::sync::Mutex::new(RestartTrackerState {
+                restart_count: 0,
+                last_restart: Instant::now(),
+            }),
+        }
+    }
+
+    /// Authoritative check made by the supervisor. Applies the restart-window reset and intensity
+    /// limit, recording the restart when it is allowed.
+    pub fn record_restart(&self) -> ControlFlow<NoRestartReason> {
+        let mut state = self.state.lock().unwrap();
+
         // Reset count if outside time window
         let now = Instant::now();
-        if now.duration_since(self.last_restart) > self.restart_window {
-            self.restart_count = 0;
+        if now.duration_since(state.last_restart) > self.restart_window {
+            state.restart_count = 0;
         }
 
         // Intensity check
-        if self.restart_count >= self.max_restarts {
+        if state.restart_count >= self.max_restarts {
             return ControlFlow::Break(NoRestartReason::MaxRestartsExceeded {
-                restart_count: self.restart_count,
+                restart_count: state.restart_count,
                 max_restarts: self.max_restarts,
             });
         }
 
-        self.restart_count += 1;
-        self.last_restart = now;
+        state.restart_count += 1;
+        state.last_restart = now;
 
         ControlFlow::Continue(())
+    }
+
+    /// Read-only mirror of [`Self::record_restart`]'s intensity decision, used by the child to
+    /// predict whether the supervisor will restart it. Does not mutate the count.
+    pub fn predict_restart(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        let count = if Instant::now().duration_since(state.last_restart) > self.restart_window {
+            0
+        } else {
+            state.restart_count
+        };
+        count < self.max_restarts
+    }
+
+    #[cfg(feature = "console")]
+    pub fn max_restarts(&self) -> u32 {
+        self.max_restarts
+    }
+
+    #[cfg(feature = "console")]
+    pub fn restart_window(&self) -> Duration {
+        self.restart_window
+    }
+
+    #[cfg(any(feature = "tracing", feature = "console"))]
+    pub fn current_count(&self) -> u32 {
+        self.state.lock().unwrap().restart_count
     }
 }
 

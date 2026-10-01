@@ -16,7 +16,7 @@ use crate::{
     error::{ActorStopReason, PanicError, PanicReason},
     links::{BoxMailboxReceiver, Link, ShutdownFn},
     mailbox::{MailboxReceiver, Signal},
-    message::BoxMessage,
+    message::{BoxMessage, CallbackFn, Context},
     reply::BoxReplySender,
     supervision::SupervisionStrategy,
 };
@@ -135,12 +135,14 @@ where
             #[cfg(not(feature = "otel"))]
             {
                 let span = tracing::info_span!(
+                    parent: None,
                     "actor.handle_message",
                     actor.name = A::name(),
                     actor.id = %actor_id,
                     message = message_name,
                 );
                 span.follows_from(&caller_span);
+                span.follows_from(tracing::Span::current());
                 span
             }
 
@@ -151,6 +153,7 @@ where
 
                 let span_name = format!("{}.{message_name}", A::name());
                 let span = tracing::info_span!(
+                    parent: None,
                     "actor.handle_message",
                     otel.name = %span_name,
                     actor.name = A::name(),
@@ -160,6 +163,13 @@ where
 
                 let caller_span_ctx = caller_span.context().span().span_context().clone();
                 span.add_link(caller_span_ctx);
+
+                let lifecycle_span_ctx = tracing::Span::current()
+                    .context()
+                    .span()
+                    .span_context()
+                    .clone();
+                span.add_link(lifecycle_span_ctx);
 
                 span
             }
@@ -199,6 +209,31 @@ where
         }
     }
 
+    pub(crate) async fn handle_callback(
+        &mut self,
+        actor_ref: ActorRef<A>,
+        callback: CallbackFn<A>,
+    ) -> ControlFlow<ActorStopReason> {
+        let mut ctx: Context<A, ()> = Context::new(actor_ref, None, false);
+
+        let res = AssertUnwindSafe(callback(&mut self.state, &mut ctx))
+            .catch_unwind()
+            .await;
+
+        match res {
+            Ok(()) => {
+                if ctx.should_stop() {
+                    ControlFlow::Break(ActorStopReason::Normal)
+                } else {
+                    ControlFlow::Continue(())
+                }
+            }
+            Err(err) => ControlFlow::Break(ActorStopReason::Panicked(
+                PanicError::new_from_panic_any(err, PanicReason::HandlerPanic),
+            )), // The continuation panicked
+        }
+    }
+
     pub(crate) async fn handle_link_died(
         &mut self,
         id: ActorId,
@@ -207,7 +242,7 @@ where
         dead_actor_sibblings: Option<HashMap<ActorId, Link>>,
     ) -> ControlFlow<ActorStopReason> {
         {
-            let mut links = self.actor_ref.links.lock().await;
+            let links = self.actor_ref.links.lock().await;
 
             // Check if we're already coordinating a restart
             if let CoordinationState::Coordinating {
@@ -231,13 +266,13 @@ where
                 return ControlFlow::Continue(());
             }
 
-            if let Some(spec) = links.children.get_mut(&id) {
+            if let Some(spec) = links.children.get(&id) {
                 let should_restart = spec.should_restart(&reason);
                 let factory = Arc::clone(&spec.factory);
                 #[cfg(feature = "tracing")]
-                let restart_count = spec.restart_count;
+                let restart_count = spec.restart_tracker.current_count();
 
-                // Extract what we need for coordination before dropping mutable borrow
+                // Extract what we need for coordination before borrowing children again
                 let strategy_info = match should_restart {
                     ControlFlow::Continue(()) => match A::supervision_strategy() {
                         SupervisionStrategy::OneForOne => None,
